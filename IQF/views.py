@@ -1865,7 +1865,7 @@ class IQFTrayRejectionAPIView(APIView):
             accepted_trays = data.get('accepted_trays', [])    # [{tray_id, qty, sequence}]
             acceptance_remarks = data.get('acceptance_remarks', '').strip()
 
-            if not lot_id or not tray_rejections or not accepted_trays:
+            if not lot_id:
                 return Response({'success': False, 'error': 'Missing required fields'}, status=400)
 
             # Get physical_qty from TotalStockModel
@@ -1875,8 +1875,27 @@ class IQFTrayRejectionAPIView(APIView):
             # Calculate total entered rejection qty
             total_entered_qty = sum(int(item['quantity']) for item in tray_rejections if int(item['quantity']) > 0)
 
+            is_brass_rejection = False
+            if total_entered_qty == 0:
+                use_audit = getattr(total_stock_obj, 'send_brass_audit_to_iqf', False)
+                if use_audit:
+                    brass_rejection_store = Brass_Audit_Rejection_ReasonStore.objects.filter(lot_id=lot_id).first()
+                    brass_rejected_trays = Brass_Audit_Rejected_TrayScan.objects.filter(lot_id=lot_id)
+                else:
+                    brass_rejection_store = Brass_QC_Rejection_ReasonStore.objects.filter(lot_id=lot_id).first()
+                    brass_rejected_trays = Brass_QC_Rejected_TrayScan.objects.filter(lot_id=lot_id)
+                if brass_rejection_store and brass_rejection_store.total_rejection_quantity > 0:
+                    total_entered_qty = brass_rejection_store.total_rejection_quantity
+                    is_brass_rejection = True
+                    reason_qty = {}
+                    for tray in brass_rejected_trays:
+                        reason_id = tray.rejection_reason.rejection_reason_id
+                        qty = int(tray.rejected_tray_quantity or 0)
+                        reason_qty[reason_id] = reason_qty.get(reason_id, 0) + qty
+                    tray_rejections = [{'reason_id': rid, 'quantity': str(qty)} for rid, qty in reason_qty.items()]
+
             # If all qty is rejected, skip acceptance remarks and save as full rejection
-            if physical_qty == total_entered_qty:
+            if physical_qty == total_entered_qty or is_brass_rejection:
                 # Save as full lot rejection
                 total_stock_obj.iqf_rejection = True
                 total_stock_obj.last_process_module = "IQF"
@@ -1951,7 +1970,7 @@ class IQFTrayRejectionAPIView(APIView):
                     return Response({'success': True, 'message': 'Full lot rejection saved.'})
 
             # Else, require acceptance remarks and save as few cases acceptance
-            if not acceptance_remarks:
+            if total_entered_qty > 0 and not acceptance_remarks:
                 return Response({'success': False, 'error': 'Acceptance remarks are required.'}, status=400)
 
             # Save rejection reasons and qty (no tray_id) in IQF_Rejection_ReasonStore
